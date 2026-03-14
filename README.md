@@ -10,3 +10,4 @@ One finger tab
 Stop drawing/clicking:
 Fist
 
+![Preview](https://github.com/Leo7247/HandDraw/blob/cd12d49aeff37dc7f537b5bc6e26dc797602d8a3/HD%20Buttons.png)
