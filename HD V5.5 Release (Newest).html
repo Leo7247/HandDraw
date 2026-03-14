@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Hand Draw - Draw with AR</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, sans-serif;
+    }
+    #container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+    }
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    /* Mirror the display */
+    video, canvas {
+      transform: scaleX(-1);
+    }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="container">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <script>
+    // ==================== Basic Setup ====================
+    const videoElement = document.getElementById('video');
+    const canvasElement = document.getElementById('canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+
+    // Drawing States
+    let paths = []; 
+    let currentPath = null;
+    let isDrawing = false;
+    
+    // Tool States
+    let currentColor = '#FF3B30';
+    let currentMode = 'draw'; 
+    let currentPenSize = 5;
+    let currentEraserSize = 40;
+    let lastClickTime = 0;
+    
+    // Shape States
+    let activeShape = null; 
+    let isShapeDragging = false;
+    let selectedShapeType = 'line';
+    
+    // UI Modals
+    let showClearConfirm = false;
+    let showShapeMenu = false;
+    let showColorMenu = false; 
+    let tempMenuShape = 'line';
+
+    // 16-Color AR Palette
+    const colorPalette = [
+      '#FF1493', '#9400D3', '#4B0082', '#0000FF',
+      '#00BFFF', '#00FA9A', '#32CD32', '#FFD700',
+      '#FF8C00', '#FF0000', '#8B4513', '#A9A9A9',
+      '#FFFFFF', '#FFB6C1', '#008080', '#000000'
+    ];
+    const colorMenuBtns = [];
+    const shapeMenuBtns = [];
+
+    // AR Main UI Setup
+    const buttonRadius = 32;
+    const uiConfigs = [
+      { id: 'red', color: '#FF3B30', type: 'color', label: 'Red' },
+      { id: 'green', color: '#34C759', type: 'color', label: 'Green' },
+      { id: 'blue', color: '#007AFF', type: 'color', label: 'Blue' },
+      { id: 'yellow', color: '#FFD60A', type: 'color', label: 'Yellow' },
+      { id: 'custom_color', color: '#9C27B0', type: 'custom_color', label: 'Custom' },
+      { id: 'erase', color: '#FFFFFF', type: 'erase', label: 'Erase' },
+      { id: 'clear', color: '#FFFFFF', type: 'clear', label: 'Clear' },
+      { id: 'size_s', color: '#AAAAAA', type: 'size', value: 10, label: 'Small' },
+      { id: 'size_m', color: '#AAAAAA', type: 'size', value: 40, label: 'Med' },
+      { id: 'size_l', color: '#AAAAAA', type: 'size', value: 80, label: 'Large' },
+      { id: 'shape_menu', color: '#FF9500', type: 'open_shape_menu', label: 'Shapes' }
+    ];
+
+    // Helper: Opposite Color Outline
+    function getOppositeColor(hex) {
+      if (hex.startsWith('#')) hex = hex.slice(1);
+      if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+      let r = parseInt(hex.slice(0, 2), 16);
+      let g = parseInt(hex.slice(2, 4), 16);
+      let b = parseInt(hex.slice(4, 6), 16);
+      if (isNaN(r) || isNaN(g) || isNaN(b)) return '#FFFFFF'; 
+      
+      r = (255 - r).toString(16).padStart(2, '0');
+      g = (255 - g).toString(16).padStart(2, '0');
+      b = (255 - b).toString(16).padStart(2, '0');
+      return '#' + r + g + b;
+    }
+
+    // Helper: Text with dark outline
+    function drawText(ctx, text, x, y, font, color) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(-1, 1); 
+      ctx.font = font;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 3;
+      ctx.strokeText(text, 0, 0);
+      ctx.fillStyle = color;
+      ctx.fillText(text, 0, 0);
+      ctx.restore();
+    }
+
+    // Draw Shapes
+    function drawShape(ctx, shape) {
+      ctx.beginPath();
+      ctx.strokeStyle = shape.color;
+      ctx.lineWidth = shape.size;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      if (shape.type === 'line') {
+        ctx.moveTo(shape.x1, shape.y1);
+        ctx.lineTo(shape.x2, shape.y2);
+      } else if (shape.type === 'square') {
+        ctx.rect(shape.x1, shape.y1, shape.x2 - shape.x1, shape.y2 - shape.y1);
+      } else if (shape.type === 'circle') {
+        const cx = (shape.x1 + shape.x2) / 2;
+        const cy = (shape.y1 + shape.y2) / 2;
+        const r = Math.hypot(shape.x2 - shape.x1, shape.y2 - shape.y1) / 2;
+        if (r > 0) ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+      }
+      ctx.stroke();
+    }
+
+    // Redraw all stored paths and baked shapes (FIXED: Crash proofed)
+    function redrawPaths() {
+      for (const item of paths) {
+        if (item.isShape) { 
+          // Safely handles stamped shapes
+          drawShape(canvasCtx, item);
+        } else {
+          // Safely handles freehand drawings
+          if (!item.points || item.points.length < 2) continue; 
+          
+          canvasCtx.beginPath();
+          canvasCtx.moveTo(item.points[0].x, item.points[0].y);
+          for (let i = 1; i < item.points.length; i++) {
+            canvasCtx.lineTo(item.points[i].x, item.points[i].y);
+          }
+          if (item.isEraser) {
+            canvasCtx.globalCompositeOperation = 'destination-out';
+            canvasCtx.strokeStyle = 'rgba(0,0,0,1)';
+          } else {
+            canvasCtx.globalCompositeOperation = 'source-over';
+            canvasCtx.strokeStyle = item.color;
+          }
+          canvasCtx.lineWidth = item.size;
+          canvasCtx.lineCap = 'round';
+          canvasCtx.lineJoin = 'round';
+          canvasCtx.stroke();
+        }
+      }
+      canvasCtx.globalCompositeOperation = 'source-over';
+    }
+
+    // Draw Top UI Buttons
+    function drawVirtualUI() {
+      let currentX = 60;
+      let currentY = 60;
+      const paddingX = 85;
+      const paddingY = 85;
+
+      uiConfigs.forEach((btn) => {
+        if (currentX > canvasElement.width - 60) {
+          currentX = 60;
+          currentY += paddingY;
+        }
+        btn.x = currentX; 
+        btn.y = currentY;
+
+        canvasCtx.beginPath();
+        canvasCtx.arc(currentX, currentY, buttonRadius, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = btn.color;
+        canvasCtx.fill();
+
+        let isSelected = false;
+        if (btn.type === 'erase' && currentMode === 'erase') isSelected = true;
+        else if (btn.type === 'color' && currentMode === 'draw' && currentColor === btn.color) isSelected = true;
+        else if (btn.type === 'custom_color' && currentMode === 'draw' && currentColor === btn.color) isSelected = true;
+        else if (btn.type === 'open_shape_menu' && currentMode === 'shape') isSelected = true;
+        else if (btn.type === 'size') {
+          let activeSize = currentMode === 'erase' ? currentEraserSize : currentPenSize;
+          if (activeSize === btn.value) isSelected = true;
+        }
+
+        if (isSelected) {
+          canvasCtx.lineWidth = 4;
+          canvasCtx.strokeStyle = (btn.type === 'color' || btn.type === 'custom_color') ? getOppositeColor(btn.color) : '#FFFFFF';
+          canvasCtx.stroke();
+        }
+
+        if (btn.label) {
+           drawText(canvasCtx, btn.label, currentX, currentY, 'bold 14px sans-serif', '#FFFFFF');
+        }
+        currentX += paddingX;
+      });
+    }
+
+    // Draw Shape Menu Floating Panel
+    function drawShapeMenu() {
+      const cx = canvasElement.width / 2;
+      const cy = canvasElement.height / 2;
+      
+      canvasCtx.fillStyle = 'rgba(40, 40, 40, 0.9)';
+      canvasCtx.fillRect(cx - 180, cy - 120, 360, 240);
+      canvasCtx.strokeStyle = '#FFFFFF';
+      canvasCtx.lineWidth = 2;
+      canvasCtx.strokeRect(cx - 180, cy - 120, 360, 240);
+      
+      drawText(canvasCtx, 'Select Shape', cx, cy - 80, 'bold 22px sans-serif', '#FFFFFF');
+
+      shapeMenuBtns.length = 0;
+      shapeMenuBtns.push({ id: 'line', x: cx + 90, y: cy - 20, radius: 35, label: 'Line' });
+      shapeMenuBtns.push({ id: 'square', x: cx, y: cy - 20, radius: 35, label: 'Square' });
+      shapeMenuBtns.push({ id: 'circle', x: cx - 90, y: cy - 20, radius: 35, label: 'Circle' });
+      shapeMenuBtns.push({ id: 'cancel', x: cx + 70, y: cy + 70, radius: 25, label: 'Cancel', color: '#FF3B30' });
+      shapeMenuBtns.push({ id: 'ok', x: cx - 70, y: cy + 70, radius: 25, label: 'OK', color: '#34C759' });
+
+      shapeMenuBtns.forEach(btn => {
+        canvasCtx.beginPath();
+        canvasCtx.arc(btn.x, btn.y, btn.radius, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = btn.color || (tempMenuShape === btn.id ? '#888888' : '#222222');
+        canvasCtx.fill();
+        
+        if (btn.color) { 
+          drawText(canvasCtx, btn.label, btn.x, btn.y, 'bold 16px sans-serif', '#FFFFFF');
+        } else {
+          canvasCtx.strokeStyle = '#FFFFFF'; canvasCtx.lineWidth = 3; canvasCtx.beginPath();
+          if (btn.id === 'line') { canvasCtx.moveTo(btn.x + 15, btn.y - 15); canvasCtx.lineTo(btn.x - 15, btn.y + 15); } 
+          else if (btn.id === 'square') { canvasCtx.rect(btn.x - 15, btn.y - 15, 30, 30); } 
+          else if (btn.id === 'circle') { canvasCtx.arc(btn.x, btn.y, 15, 0, 2 * Math.PI); }
+          canvasCtx.stroke();
+        }
+      });
+    }
+
+    // Draw Custom Color Floating Panel
+    function drawColorMenu() {
+      const cx = canvasElement.width / 2;
+      const cy = canvasElement.height / 2;
+      
+      canvasCtx.fillStyle = 'rgba(40, 40, 40, 0.9)';
+      canvasCtx.fillRect(cx - 180, cy - 180, 360, 360); 
+      canvasCtx.strokeStyle = '#FFFFFF';
+      canvasCtx.lineWidth = 2;
+      canvasCtx.strokeRect(cx - 180, cy - 180, 360, 360);
+      
+      drawText(canvasCtx, 'Custom Palette', cx, cy - 140, 'bold 22px sans-serif', '#FFFFFF');
+
+      colorMenuBtns.length = 0;
+      let startX = cx - 105;
+      let startY = cy - 80;
+      
+      colorPalette.forEach((col, idx) => {
+        const row = Math.floor(idx / 4);
+        const cCol = idx % 4;
+        const x = startX + cCol * 70;
+        const y = startY + row * 60;
+        colorMenuBtns.push({ id: col, x: x, y: y, radius: 22, color: col });
+        
+        canvasCtx.beginPath();
+        canvasCtx.arc(x, y, 22, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = col;
+        canvasCtx.fill();
+        canvasCtx.strokeStyle = '#FFFFFF';
+        canvasCtx.lineWidth = 2;
+        canvasCtx.stroke();
+      });
+      
+      colorMenuBtns.push({ id: 'cancel', x: cx, y: cy + 130, radius: 25, label: 'Close', color: '#FF3B30' });
+      canvasCtx.beginPath();
+      canvasCtx.arc(cx, cy + 130, 25, 0, 2 * Math.PI);
+      canvasCtx.fillStyle = '#FF3B30';
+      canvasCtx.fill();
+      drawText(canvasCtx, 'Close', cx, cy + 130, 'bold 16px sans-serif', '#FFFFFF');
+    }
+
+    function switchMode(newMode) {
+      if (currentMode === 'shape' && activeShape && newMode !== 'shape') {
+        paths.push(activeShape);
+        activeShape = null;
+      }
+      currentMode = newMode;
+    }
+
+    // Unified Click Handler
+    function processClick(x, y, isInstant = false) {
+      const now = Date.now();
+      if (!isInstant && now - lastClickTime < 500) return;
+
+      if (showClearConfirm) {
+        const cx = canvasElement.width / 2; const cy = canvasElement.height / 2;
+        const yesBtn = { x: cx - 70, y: cy + 40, radius: 35 }; 
+        const noBtn = { x: cx + 70, y: cy + 40, radius: 35 };
+        
+        if (Math.hypot(x - yesBtn.x, y - yesBtn.y) < yesBtn.radius) { paths = []; activeShape = null; showClearConfirm = false; }
+        else if (Math.hypot(x - noBtn.x, y - noBtn.y) < noBtn.radius) { showClearConfirm = false; }
+        lastClickTime = now; return; 
+      }
+
+      if (showColorMenu) {
+        for (const btn of colorMenuBtns) {
+          if (Math.hypot(x - btn.x, y - btn.y) < btn.radius) {
+            if (btn.id === 'cancel') {
+              showColorMenu = false;
+            } else {
+              currentColor = btn.color;
+              const customBtn = uiConfigs.find(b => b.id === 'custom_color');
+              if(customBtn) customBtn.color = currentColor;
+              switchMode('draw');
+              showColorMenu = false;
+            }
+            lastClickTime = now; return;
+          }
+        }
+        return; 
+      }
+
+      if (showShapeMenu) {
+        for (const btn of shapeMenuBtns) {
+          if (Math.hypot(x - btn.x, y - btn.y) < btn.radius) {
+            if (btn.id === 'ok') {
+              selectedShapeType = tempMenuShape;
+              switchMode('shape');
+              showShapeMenu = false;
+            } else if (btn.id === 'cancel') {
+              showShapeMenu = false;
+            } else {
+              tempMenuShape = btn.id; 
+            }
+            lastClickTime = now; return;
+          }
+        }
+        return; 
+      }
+
+      for (const btn of uiConfigs) {
+        if (Math.hypot(x - btn.x, y - btn.y) < buttonRadius) {
+          if (btn.type === 'color') {
+            currentColor = btn.color;
+            switchMode('draw');
+          } else if (btn.type === 'custom_color') {
+            showColorMenu = true; 
+          } else if (btn.type === 'erase') {
+            switchMode('erase');
+          } else if (btn.type === 'clear') {
+            showClearConfirm = true;
+          } else if (btn.type === 'open_shape_menu') {
+            showShapeMenu = true;
+          } else if (btn.type === 'size') {
+            if (currentMode === 'erase') currentEraserSize = btn.value;
+            else currentPenSize = btn.value;
+          }
+          lastClickTime = now; return;
+        }
+      }
+    }
+
+    canvasElement.addEventListener('pointerdown', (e) => {
+      const rect = canvasElement.getBoundingClientRect();
+      const scaleX = canvasElement.width / rect.width;
+      const scaleY = canvasElement.height / rect.height;
+      const x = canvasElement.width - ((e.clientX - rect.left) * scaleX);
+      const y = (e.clientY - rect.top) * scaleY;
+      processClick(x, y, true);
+    });
+
+    // ==================== MediaPipe Hands Init ====================
+    const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+    // ==================== Main Loop ====================
+    hands.onResults((results) => {
+      canvasElement.width = videoElement.videoWidth || 1280;
+      canvasElement.height = videoElement.videoHeight || 720;
+
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+      try {
+        redrawPaths();
+        if (activeShape) drawShape(canvasCtx, activeShape);
+        drawVirtualUI();
+
+        if (showClearConfirm) {
+          const cx = canvasElement.width / 2; const cy = canvasElement.height / 2;
+          canvasCtx.fillStyle = 'rgba(40, 40, 40, 0.9)';
+          canvasCtx.fillRect(cx - 150, cy - 100, 300, 200);
+          canvasCtx.strokeStyle = '#FFFFFF';
+          canvasCtx.lineWidth = 2;
+          canvasCtx.strokeRect(cx - 150, cy - 100, 300, 200);
+          drawText(canvasCtx, 'Clear Canvas?', cx, cy - 40, 'bold 24px sans-serif', '#FFFFFF');
+          
+          canvasCtx.beginPath(); canvasCtx.arc(cx - 70, cy + 40, 35, 0, 2*Math.PI); canvasCtx.fillStyle = '#34C759'; canvasCtx.fill();
+          drawText(canvasCtx, 'Yes', cx - 70, cy + 40, 'bold 16px sans-serif', '#FFFFFF');
+          
+          canvasCtx.beginPath(); canvasCtx.arc(cx + 70, cy + 40, 35, 0, 2*Math.PI); canvasCtx.fillStyle = '#FF3B30'; canvasCtx.fill();
+          drawText(canvasCtx, 'No', cx + 70, cy + 40, 'bold 16px sans-serif', '#FFFFFF');
+        }
+
+        if (showShapeMenu) drawShapeMenu();
+        if (showColorMenu) drawColorMenu(); 
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+          for (const landmarks of results.multiHandLandmarks) {
+            drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00ff00', lineWidth: 2});
+            drawLandmarks(canvasCtx, landmarks, {color: '#ff0000', fillColor: '#ff000044', lineWidth: 1, radius: 2});
+
+            const ix = landmarks[8].x * canvasElement.width;
+            const iy = landmarks[8].y * canvasElement.height;
+            const tx = landmarks[4].x * canvasElement.width;
+            const ty = landmarks[4].y * canvasElement.height;
+
+            const pinchDist = Math.hypot(ix - tx, iy - ty);
+            const isPinching = pinchDist < 50; 
+            let activeSize = currentMode === 'erase' ? currentEraserSize : currentPenSize;
+
+            if (!isPinching) {
+              
+              // IMMEDIATELY BAKE THE SHAPE WHEN THE USER STOPS PINCHING
+              if (isShapeDragging && activeShape) {
+                paths.push(activeShape); // Safely push the shape into history
+                activeShape = null;
+              }
+              isShapeDragging = false;
+
+              processClick(ix, iy); // 1 Finger Open = Click
+
+              if (!showShapeMenu && !showClearConfirm && !showColorMenu) {
+                canvasCtx.beginPath();
+                canvasCtx.arc(ix, iy, activeSize / 2, 0, 2 * Math.PI);
+                if (currentMode === 'erase') {
+                  canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+                  canvasCtx.lineWidth = 2;
+                  canvasCtx.stroke();
+                } else if (currentMode === 'draw') {
+                  canvasCtx.fillStyle = currentColor;
+                  canvasCtx.fill();
+                } else if (currentMode === 'shape') {
+                   drawText(canvasCtx, '+', ix, iy, 'bold 30px sans-serif', currentColor);
+                }
+              }
+            } else {
+              if (!showShapeMenu && !showClearConfirm && !showColorMenu) {
+                
+                if (currentMode === 'shape') {
+                  if (!isShapeDragging) {
+                    isShapeDragging = true;
+                    // Tagged securely with `isShape: true` to prevent crashes!
+                    activeShape = { isShape: true, type: selectedShapeType, color: currentColor, size: currentPenSize, x1: ix, y1: iy, x2: ix, y2: iy };
+                  } else {
+                    activeShape.x2 = ix;
+                    activeShape.y2 = iy;
+                  }
+                } else {
+                  if (!isDrawing) {
+                    isDrawing = true;
+                    currentPath = { color: currentColor, isEraser: currentMode === 'erase', size: activeSize, points: [] };
+                    paths.push(currentPath);
+                  }
+                  currentPath.points.push({x: ix, y: iy});
+                  
+                  if (currentPath.points.length >= 2) {
+                    const len = currentPath.points.length;
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(currentPath.points[len-2].x, currentPath.points[len-2].y);
+                    canvasCtx.lineTo(currentPath.points[len-1].x, currentPath.points[len-1].y);
+                    
+                    if (currentPath.isEraser) {
+                      canvasCtx.globalCompositeOperation = 'destination-out';
+                      canvasCtx.lineWidth = currentPath.size;
+                      canvasCtx.strokeStyle = 'rgba(0,0,0,1)';
+                    } else {
+                      canvasCtx.globalCompositeOperation = 'source-over';
+                      canvasCtx.lineWidth = currentPath.size;
+                      canvasCtx.strokeStyle = currentPath.color;
+                    }
+                    canvasCtx.lineCap = 'round';
+                    canvasCtx.lineJoin = 'round';
+                    canvasCtx.stroke();
+                    canvasCtx.globalCompositeOperation = 'source-over'; 
+                  }
+                }
+              }
+            }
+            if (!isPinching && isDrawing) isDrawing = false;
+          }
+        } else {
+          isDrawing = false;
+          isShapeDragging = false;
+        }
+      } catch (err) {
+        console.error("Canvas Drawing Error:", err);
+      }
+      canvasCtx.restore();
+    });
+
+    const camera = new Camera(videoElement, {
+      onFrame: async () => { await hands.send({image: videoElement}); },
+      width: 1280, height: 720
+    });
+    camera.start().catch(err => { console.error("Camera error:", err); alert("Cannot open camera."); });
+  </script>
+</body>
+</html>
