@@ -25,4 +25,5 @@ Fist
 # More Websites Recommanded
 
 - [ ] TouchCursor (Incompleted)
+- [x] WebRivals
 - [x] Flappy-Bird-Online
